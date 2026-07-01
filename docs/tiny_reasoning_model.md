@@ -147,9 +147,12 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
    left intact). At half the vocab it matches the 32K tokenizer's on-math compression (3.27 vs 3.29
    bytes/tok). **Config locked** (d12, vocab 16384): the target **d12 + MLA + tie + MTP1 + gated ≈
    110M total / 103.6M scaling → ~2.07B-token horizon** (vs 9.42B corpus ⇒ ~4.5 epochs headroom).
-2. **Pretrain baseline:** train d12 + `--use-mla --tie-embeddings --n-mtp 1 --use-gated-attn` (~110M)
-   under `NANOCHAT_BASE_DIR=~/.cache/nanochat-math NANOCHAT_BASE_DATA_DIR=~/.cache/nanochat/finemath4plus`;
-   sanity evals (val_bpb, GSM8K pass@1 from base). **First:** decide shard shuffling (see milestone 0).
+2. **Pretrain baseline** — ✅ *done this session.* Trained d12 + MLA + tie + MTP1 + gated (~110M),
+   `--window-pattern L` (SDPA has no efficient sliding-window on this no-FA3 Blackwell), 2,353 steps /
+   **1.23B tokens** (~1.9h, 183K tok/s, peak 38GB). **Val bpb 12.09 → 0.997** (clean monotonic
+   convergence). Checkpoint: `~/.cache/nanochat-math/base_checkpoints/finemath-d12/` (step 2353).
+   Qualitative check: "derivative of x^2 is" → "2x" (correct); base-model repetition/web-artifacts as
+   expected pre-SFT. Shards used unshuffled (fine here). To train longer, raise `--target-param-data-ratio`.
 3. **Distillation:** teacher CoT generation + verifier reject-sampling → SFT set.
 4. **SFT:** train on distilled CoT (thinking control token); measure GSM8K/MATH pass@1 + CoT quality.
 5. **RLVR:** ✅ MATH/sympy verifier landed (`tasks/math.py`, `extract_boxed`/`answers_equal`
