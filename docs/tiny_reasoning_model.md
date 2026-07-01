@@ -132,8 +132,15 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
   pipeline change is measurable.
 
 ## 8. Sequencing / milestones
-0. **Data corpus (milestone 0, gates everything):** assemble curated math/technical text into
-   parquet `'text'` shards; repoint `dataset.py:22-27`. Feeds both the tokenizer and pretrain.
+0. **Data corpus (milestone 0)** — ✅ *sourced & wired this session.* Corpus = **FineMath-4plus**
+   (`HuggingFaceTB/finemath`, config `finemath-4plus`): 64 parquet shards, 18GB, **9.57B tokens /
+   6.7M docs** (`text` + `token_count` columns) — ~4× the d12 ~2.3B horizon. Downloaded to `$HF_HOME`
+   and symlinked into `~/.cache/nanochat/finemath4plus/` (last shard auto-selected as val: train
+   9.42B / val 0.15B). Wired via a new `NANOCHAT_BASE_DATA_DIR` env override in `dataset.py` (ClimbMix
+   default untouched). Reproduce: `snapshot_download("HuggingFaceTB/finemath", allow_patterns=
+   "finemath-4plus/*.parquet")` → symlink the shards → `export NANOCHAT_BASE_DATA_DIR=…`.
+   **Refinement (optional, pre-pretrain):** FineMath shards aren't globally shuffled like ClimbMix;
+   the loader reads shards in order, so consider shuffling shard order (or a loader shuffle buffer).
 1. **Tokenizer + model knobs** — ✅ *cheap wins landed this session (flags in place):*
    `tok_train --single-digit-numbers`, `--tie-embeddings` (both param-count asserts fixed), and
    the `num_scaling_params` MTP crash fix. **Still pending:** retrain the BPE at ~12–16K on the
