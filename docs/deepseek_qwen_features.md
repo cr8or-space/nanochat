@@ -160,10 +160,13 @@ from the block input. Opt-in via `--use-gated-attn`; composes with MHA, GQA, MLA
 speculative decoding (all verified in `tests/test_gated_attn.py`). Applied in both attention
 paths in `gpt.py` just before `c_proj`; the gate matrix auto-joins the Muon group.
 
-### ✅ YaRN / RoPE context extension — Qwen3
-nanochat already precomputes RoPE for 10× length; adding YaRN-style frequency interpolation is
-a small change to the RoPE buffer construction and lets you extend context at/after training
-with minimal degradation. Low effort, low risk, inference-time.
+### 🚧 YaRN / RoPE context extension — Qwen3 — **implemented**
+NTK-by-parts frequency interpolation in `_rope_inv_freq`: high-frequency dims are kept
+(extrapolated), low-frequency dims are interpolated toward `inv_freq / s`, with a linear ramp
+between. Opt-in via `--rope-scaling s` / `--rope-original-seq-len`; composes with MLA (acts on
+`qk_rope_head_dim`). Tests in `tests/test_yarn.py`. **Note:** the YaRN attention-temperature
+(`mscale`) term is intentionally omitted — RoPE is norm-preserving and nanochat's QK-norm
+renormalizes q/k afterward, so `mscale` would have no effect here.
 
 ### ⛔ Gated DeltaNet / linear-attention hybrid — Qwen3-Next / Qwen 3.6 core
 Interleave linear-attention (constant-memory recurrent state) layers with full attention. It's
@@ -227,13 +230,12 @@ systems feature; lower priority than the modeling items for an educational repo.
 
 A pragmatic order that front-loads low-risk, high-value wins and defers the invasive change:
 
-1. **YaRN** — cheap context extension. *(next)*
-2. **Window-aware KV cache** — engine-only, composes with MLA for more cache savings.
-3. **GQA + FP8-KV** — cheap composable cache cuts (if not relying solely on MLA).
-4. **MoE (aux-loss-free)** — the big lesson; land as a feature-flagged variant.
-5. **Hybrid-thinking data recipe** — SFT-stage, data-bound.
+1. **Window-aware KV cache** — engine-only, composes with MLA for more cache savings. *(next)*
+2. **GQA + FP8-KV** — cheap composable cache cuts (if not relying solely on MLA).
+3. **MoE (aux-loss-free)** — the big lesson; land as a feature-flagged variant.
+4. **Hybrid-thinking data recipe** — SFT-stage, data-bound.
 
-Already landed: **MLA**, **MTP + speculative decoding**, and **gated attention** (§1).
+Already landed: **MLA**, **MTP + speculative decoding**, **gated attention**, and **YaRN** (§1).
 
 Explicitly parked: **Gated DeltaNet, DSA/sparse attention, 1M context, Engram memory,
 Manifold Hyper-Connections, 201-language scale** — see rationale above.

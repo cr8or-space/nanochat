@@ -54,6 +54,12 @@ class GPTConfig:
     # (before the output projection), computed from the block input. Improves training
     # stability; opt-in. Composes with MHA, GQA and MLA.
     use_gated_attn: bool = False
+    # YaRN RoPE context extension (Qwen3): NTK-by-parts frequency interpolation to run at
+    # sequences longer than trained. rope_scaling is the extension factor s (1.0 = disabled);
+    # rope_original_seq_len is the original context length (0 = use sequence_len). The YaRN
+    # attention-temperature (mscale) term is intentionally omitted: it is nullified by QK-norm.
+    rope_scaling: float = 1.0
+    rope_original_seq_len: int = 0
 
 
 def norm(x):
@@ -392,14 +398,39 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
+    def _rope_inv_freq(self, head_dim, base, device):
+        """RoPE inverse frequencies, with optional YaRN (NTK-by-parts) interpolation.
+
+        When rope_scaling <= 1 this is the standard 1 / base^(2i/d). When rope_scaling = s > 1,
+        high-frequency dims (short wavelength) are left unchanged (extrapolated) while
+        low-frequency dims are interpolated toward inv_freq / s, with a linear ramp between —
+        letting the model run at s x its trained context length with minimal degradation.
+        """
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))  # (head_dim // 2,)
+        scale = self.config.rope_scaling
+        if scale is None or scale <= 1.0:
+            return inv_freq
+        import math
+        L = self.config.rope_original_seq_len or self.config.sequence_len
+        beta_fast, beta_slow = 32.0, 1.0  # standard YaRN band edges (rotations over L)
+        def correction_dim(num_rot):
+            return (head_dim * math.log(L / (num_rot * 2 * math.pi))) / (2 * math.log(base))
+        low = max(math.floor(correction_dim(beta_fast)), 0)
+        high = min(math.ceil(correction_dim(beta_slow)), head_dim // 2 - 1)
+        high = max(high, low + 1e-3)  # avoid div-by-zero when low == high
+        # ramp in [0,1] over the half-dim; 1 => extrapolate (keep), 0 => interpolate (/s)
+        ramp = (torch.arange(head_dim // 2, dtype=torch.float32, device=device) - low) / (high - low)
+        extrapolation_factor = 1.0 - torch.clamp(ramp, 0.0, 1.0)
+        inv_freq_interp = inv_freq / scale
+        return inv_freq_interp * (1.0 - extrapolation_factor) + inv_freq * extrapolation_factor
+
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
-        # stride the channels
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        inv_freq = self._rope_inv_freq(head_dim, base, device)
         # stride the time steps
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         # calculate the rotation frequencies at each (time, channel) pair
