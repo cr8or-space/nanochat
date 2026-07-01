@@ -517,14 +517,19 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        # MTP heads (proj + MLP) are top-level matmul modules; setup_optimizer folds them into
+        # the Muon matrix group. Count them as their own group here so `total` stays exhaustive.
+        # They are auxiliary training-signal params (kept out of get_scaling_params' token budget).
+        mtp = sum(p.numel() for p in self.mtp_proj.parameters()) + sum(p.numel() for p in self.mtp_mlp.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + mtp + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'mtp': mtp,
             'scalars': scalars,
             'total': total,
         }
