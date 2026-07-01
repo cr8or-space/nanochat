@@ -137,6 +137,61 @@ class KVCache:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
 
 # -----------------------------------------------------------------------------
+class MLAKVCache:
+    """
+    KV cache for Multi-head Latent Attention.
+
+    Instead of full per-head K and V, we cache only the low-rank latent c_KV and the
+    shared decoupled-RoPE key k_rope (stored post-rotation). Full K/V are reconstructed
+    on the fly inside the attention module via kv_up. This is what shrinks the cache.
+    """
+
+    def __init__(self, batch_size, kv_lora_rank, qk_rope_head_dim, seq_len, num_layers, device, dtype):
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        # Pre-allocate: latent (n_layers, B, T, r) and shared rope key (n_layers, B, T, 1, rope)
+        self.latent_cache = torch.zeros(num_layers, batch_size, seq_len, kv_lora_rank, device=device, dtype=dtype)
+        self.krope_cache = torch.zeros(num_layers, batch_size, seq_len, 1, qk_rope_head_dim, device=device, dtype=dtype)
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.prev_embedding = None  # for smear, same protocol as KVCache
+
+    def reset(self):
+        self.cache_seqlens.zero_()
+        self.prev_embedding = None
+
+    def get_pos(self):
+        return self.cache_seqlens[0].item()
+
+    def advance(self, num_tokens):
+        self.cache_seqlens += num_tokens
+
+    def update_mla(self, layer_idx, c_kv, k_rope):
+        """Write this layer's new latent/rope-key at the current position, return full history.
+
+        Position is read (not advanced) here so every layer in a forward pass sees the same
+        offset; the cache is advanced once, after the final layer.
+        """
+        pos = self.cache_seqlens[0].item()
+        T = c_kv.size(1)
+        self.latent_cache[layer_idx, :, pos:pos+T] = c_kv
+        self.krope_cache[layer_idx, :, pos:pos+T] = k_rope
+        return self.latent_cache[layer_idx, :, :pos+T], self.krope_cache[layer_idx, :, :pos+T]
+
+    def prefill(self, other):
+        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
+        assert self.n_layers == other.n_layers and self.kv_lora_rank == other.kv_lora_rank
+        assert self.max_seq_len >= other.max_seq_len
+        other_pos = other.get_pos()
+        self.latent_cache[:, :, :other_pos] = other.latent_cache[:, :, :other_pos]
+        self.krope_cache[:, :, :other_pos] = other.krope_cache[:, :, :other_pos]
+        self.cache_seqlens.fill_(other_pos)
+        if other.prev_embedding is not None:
+            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+
+# -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
@@ -198,27 +253,23 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        if getattr(m, "use_mla", False):
+            def make_cache(batch_size, seq_len):
+                return MLAKVCache(batch_size=batch_size, kv_lora_rank=m.kv_lora_rank,
+                                  qk_rope_head_dim=m.qk_rope_head_dim, seq_len=seq_len,
+                                  num_layers=m.n_layer, device=device, dtype=dtype)
+        else:
+            def make_cache(batch_size, seq_len):
+                return KVCache(batch_size=batch_size, seq_len=seq_len, num_heads=m.n_kv_head,
+                               head_dim=m.n_embd // m.n_head, num_layers=m.n_layer, device=device, dtype=dtype)
+        kv_cache_prefill = make_cache(1, len(tokens))
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        kv_cache_decode = make_cache(num_samples, kv_length_hint)
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
 

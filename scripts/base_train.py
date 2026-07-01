@@ -52,6 +52,12 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Multi-head Latent Attention (MLA): low-rank KV cache for higher quality-per-cache-byte
+parser.add_argument("--use-mla", action="store_true", help="use Multi-head Latent Attention (DeepSeek-V2/V3 style low-rank KV cache)")
+parser.add_argument("--mla-preset", type=str, default="4x", choices=["4x", "8x"], help="MLA compression preset (sets kv_lora_rank unless overridden): 4x (best quality) or 8x (smaller cache)")
+parser.add_argument("--kv-lora-rank", type=int, default=-1, help="MLA KV latent dim (-1 = derive from --mla-preset)")
+parser.add_argument("--qk-rope-head-dim", type=int, default=64, help="MLA decoupled-RoPE head dim (shared across heads)")
+parser.add_argument("--q-lora-rank", type=int, default=0, help="MLA query compression rank (0 = uncompressed queries)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -133,10 +139,14 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    # MLA: pick kv_lora_rank from the preset unless explicitly overridden
+    kv_lora_rank = args.kv_lora_rank if args.kv_lora_rank > 0 else {"4x": 512, "8x": 256}[args.mla_preset]
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        use_mla=args.use_mla, kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=args.qk_rope_head_dim, q_lora_rank=args.q_lora_rank,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

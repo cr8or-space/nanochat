@@ -37,6 +37,13 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Multi-head Latent Attention (MLA, DeepSeek-V2/V3): cache a low-rank KV latent
+    # instead of full per-head K/V to maximize quality-per-cache-byte. Opt-in; when
+    # False the model is the standard MHA/GQA model and none of the fields below apply.
+    use_mla: bool = False
+    kv_lora_rank: int = 512   # dim of the compressed KV latent (c_KV) that gets cached
+    qk_rope_head_dim: int = 64 # decoupled-RoPE dim (shared across heads, also cached)
+    q_lora_rank: int = 0      # optional query compression (0 = uncompressed; query is not cached)
 
 
 def norm(x):
@@ -72,14 +79,42 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.use_mla = config.use_mla
+        if self.use_mla:
+            # Multi-head Latent Attention: K/V are reconstructed from a low-rank latent.
+            # We keep per-head q/k/v dims == head_dim (splitting RoPE within head_dim) so
+            # the FA3 uniform-head-dim fast path and c_q/c_proj shapes are unchanged.
+            self.qk_rope_head_dim = config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
+            assert self.qk_nope_head_dim > 0, "qk_rope_head_dim must be < head_dim"
+            self.v_head_dim = self.head_dim
+            self.kv_lora_rank = config.kv_lora_rank
+            self.q_lora_rank = config.q_lora_rank
+            if self.q_lora_rank > 0:
+                self.q_down = Linear(self.n_embd, self.q_lora_rank, bias=False)
+                self.q_up = Linear(self.q_lora_rank, self.n_head * self.head_dim, bias=False)
+            else:
+                self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            # down-projection produces [c_KV (latent) | k_rope (shared decoupled-RoPE key)]
+            self.kv_down = Linear(self.n_embd, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
+            # up-projection reconstructs per-head [k_nope | v] from the latent
+            self.kv_up = Linear(self.kv_lora_rank, self.n_head * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
+            self.c_proj = Linear(self.n_head * self.v_head_dim, self.n_embd, bias=False)
+            # Value embeddings are disabled on MLA layers: their per-token contribution to V
+            # cannot be reconstructed from a latent-only cache at decode time. (Folding them
+            # into the latent is a natural follow-up.)
+            self.ve_gate = None
+        else:
+            self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+            self.ve_gate_channels = 12
+            self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        if self.use_mla:
+            return self._forward_mla(x, cos_sin, window_size, kv_cache)
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -121,6 +156,55 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+    def _forward_mla(self, x, cos_sin, window_size, kv_cache):
+        """Multi-head Latent Attention forward (training and inference).
+
+        Only the low-rank latent c_KV and the shared decoupled-RoPE key k_rope are
+        cached; full per-head K and V are reconstructed on the fly via kv_up. The
+        RoPE'd k_rope is stored post-rotation so history never needs re-roping.
+        """
+        B, T, C = x.size()
+        cos, sin = cos_sin  # sized to qk_rope_head_dim for MLA models
+
+        # Queries: (B, T, H, head_dim); RoPE applied only to the trailing rope slice
+        q = (self.q_up(self.q_down(x)) if self.q_lora_rank > 0 else self.c_q(x))
+        q = q.view(B, T, self.n_head, self.head_dim)
+        q_nope, q_rope = q[..., :self.qk_nope_head_dim], q[..., self.qk_nope_head_dim:]
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        q = torch.cat([q_nope, q_rope], dim=-1)
+
+        # KV down-projection -> [c_KV (latent) | k_rope (shared, single head)]
+        kv = self.kv_down(x)
+        c_kv, k_rope = kv[..., :self.kv_lora_rank], kv[..., self.kv_lora_rank:]
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), cos, sin)  # (B, T, 1, rope_dim)
+
+        # Cache the latent + roped shared key, read back the full history
+        if kv_cache is not None:
+            c_kv, k_rope = kv_cache.update_mla(self.layer_idx, c_kv, k_rope)
+        Tk = c_kv.size(1)
+
+        # Up-project the full latent history -> per-head [k_nope | v]
+        kv_up = self.kv_up(c_kv).view(B, Tk, self.n_head, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv_up[..., :self.qk_nope_head_dim], kv_up[..., self.qk_nope_head_dim:]
+        # Assemble full keys: per-head content dims + the shared rope key broadcast to all heads
+        k_rope_b = k_rope.expand(B, Tk, self.n_head, self.qk_rope_head_dim)
+        k = torch.cat([k_nope, k_rope_b], dim=-1)
+
+        q, k = norm(q), norm(k)  # QK norm, matching the MHA path
+        q = q * 1.2
+        k = k * 1.2
+
+        # q spans the current T tokens; k/v span the full history (Tk). causal + window
+        # masking is handled by flash_attn_func (bottom-right aligned when T != Tk).
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
+        if kv_cache is not None and self.layer_idx == kv_cache.n_layers - 1:
+            kv_cache.advance(T)
+
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -187,7 +271,7 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer) and not config.use_mla})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -222,10 +306,20 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            attn = block.attn
+            if attn.use_mla:
+                if attn.q_lora_rank > 0:
+                    torch.nn.init.uniform_(attn.q_down.weight, -s, s)
+                    torch.nn.init.uniform_(attn.q_up.weight, -s, s)
+                else:
+                    torch.nn.init.uniform_(attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(attn.kv_down.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(attn.kv_up.weight, -s, s)
+            else:
+                torch.nn.init.uniform_(attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -252,9 +346,11 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
-        # Rotary embeddings
+        # Rotary embeddings. For MLA, RoPE acts only on the decoupled rope slice
+        # (qk_rope_head_dim); otherwise it acts on the full head_dim.
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        rotary_dim = self.config.qk_rope_head_dim if self.config.use_mla else head_dim
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, rotary_dim)
         self.cos, self.sin = cos, sin
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
@@ -394,11 +490,13 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Value embeddings group (empty when use_mla, which disables value embeddings)
+        if value_embeds_params:
+            param_groups.append(dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
