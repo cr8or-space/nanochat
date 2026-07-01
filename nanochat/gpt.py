@@ -60,6 +60,11 @@ class GPTConfig:
     # attention-temperature (mscale) term is intentionally omitted: it is nullified by QK-norm.
     rope_scaling: float = 1.0
     rope_original_seq_len: int = 0
+    # Tie the token embedding (wte) and output head (lm_head) to share one weight matrix.
+    # nanochat unties by default; tying halves the embedding param cost, which is a big win in
+    # the tiny + small-vocab regime. Opt-in. When True the shared weight uses the wte init and
+    # the wte optimizer group (the lm_head-specific tiny init / unembedding LR do not apply).
+    tie_embeddings: bool = False
 
 
 def norm(x):
@@ -279,6 +284,10 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Optionally tie the output head to the token embedding (share one weight matrix).
+        # wte and lm_head are padded to the same vocab size, so the shapes already match.
+        if config.tie_embeddings:
+            self.lm_head.weight = self.transformer.wte.weight
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -328,7 +337,9 @@ class GPT(nn.Module):
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if not self.config.tie_embeddings:
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # (when tied, lm_head.weight *is* wte.weight — already initialized above)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -394,7 +405,10 @@ class GPT(nn.Module):
         # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
         # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
-            self.transformer.wte.to(dtype=COMPUTE_DTYPE)
+            # Keep wte in fp32 when tied: the shared matrix is also the unembedding, where fp32
+            # master precision matters (matches the untied lm_head, which stays fp32).
+            if not self.config.tie_embeddings:
+                self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
 
@@ -522,7 +536,11 @@ class GPT(nn.Module):
         # They are auxiliary training-signal params (kept out of get_scaling_params' token budget).
         mtp = sum(p.numel() for p in self.mtp_proj.parameters()) + sum(p.numel() for p in self.mtp_mlp.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + mtp + scalars
+        # When tied, wte and lm_head are the SAME tensor. Keep both group counts for reporting
+        # (each reflects its role, and get_scaling_params still counts the unembedding matmul via
+        # lm_head), but count the shared matrix only once in the exhaustive total.
+        shared = lm_head if self.config.tie_embeddings else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + mtp + scalars - shared
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -543,7 +561,10 @@ class GPT(nn.Module):
         matrix_params = list(self.transformer.h.parameters()) + list(self.mtp_proj.parameters()) + list(self.mtp_mlp.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
+        # When tied, lm_head.weight IS wte.weight — it appears once in self.parameters() and is
+        # trained via the embedding group, so it gets no separate lm_head group (a Parameter can't
+        # live in two groups). The lm_head-specific unembedding LR does not apply in that case.
+        lm_head_params = [] if self.config.tie_embeddings else list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
@@ -555,13 +576,15 @@ class GPT(nn.Module):
 
         # Build param_groups with all required fields explicit
         param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
+            # AdamW groups (embeddings, scalars)
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Separate lm_head (unembedding) group, only when untied (tied shares wte's group above)
+        if lm_head_params:
+            param_groups.insert(0, dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01))
         # Value embeddings group (empty when use_mla, which disables value embeddings)
         if value_embeds_params:
             param_groups.append(dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01))

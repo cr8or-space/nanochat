@@ -62,6 +62,7 @@ parser.add_argument("--q-lora-rank", type=int, default=0, help="MLA query compre
 parser.add_argument("--n-mtp", type=int, default=0, help="number of Multi-Token Prediction depths (0 = disabled)")
 parser.add_argument("--mtp-weight", type=float, default=0.3, help="weight of the averaged MTP loss relative to the main loss")
 parser.add_argument("--use-gated-attn", action="store_true", help="use gated attention (Qwen3-Next: sigmoid gate on the attention output)")
+parser.add_argument("--tie-embeddings", action="store_true", help="tie the token embedding and output head (shares one weight matrix; halves embedding params)")
 # YaRN RoPE context extension (Qwen3): run at longer sequences than trained
 parser.add_argument("--rope-scaling", type=float, default=1.0, help="YaRN RoPE extension factor (1.0 = disabled)")
 parser.add_argument("--rope-original-seq-len", type=int, default=0, help="original context length for YaRN (0 = use max_seq_len)")
@@ -157,6 +158,7 @@ def build_model_meta(depth):
         n_mtp=args.n_mtp, mtp_weight=args.mtp_weight,
         use_gated_attn=args.use_gated_attn,
         rope_scaling=args.rope_scaling, rope_original_seq_len=args.rope_original_seq_len,
+        tie_embeddings=args.tie_embeddings,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
