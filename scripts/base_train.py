@@ -61,6 +61,7 @@ parser.add_argument("--q-lora-rank", type=int, default=0, help="MLA query compre
 # Multi-Token Prediction (MTP): auxiliary heads predicting t+2, t+3, ... (+ enables speculative decoding)
 parser.add_argument("--n-mtp", type=int, default=0, help="number of Multi-Token Prediction depths (0 = disabled)")
 parser.add_argument("--mtp-weight", type=float, default=0.3, help="weight of the averaged MTP loss relative to the main loss")
+parser.add_argument("--use-gated-attn", action="store_true", help="use gated attention (Qwen3-Next: sigmoid gate on the attention output)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -151,6 +152,7 @@ def build_model_meta(depth):
         use_mla=args.use_mla, kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=args.qk_rope_head_dim, q_lora_rank=args.q_lora_rank,
         n_mtp=args.n_mtp, mtp_weight=args.mtp_weight,
+        use_gated_attn=args.use_gated_attn,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

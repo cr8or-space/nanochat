@@ -50,6 +50,10 @@ class GPTConfig:
     # at inference is numerically identical to the training-time computation.
     n_mtp: int = 0            # number of extra prediction depths (0 = disabled)
     mtp_weight: float = 0.3   # weight of the averaged MTP loss relative to the main loss
+    # Gated attention (Qwen3-Next): a per-element sigmoid gate on the attention output
+    # (before the output projection), computed from the block input. Improves training
+    # stability; opt-in. Composes with MHA, GQA and MLA.
+    use_gated_attn: bool = False
 
 
 def norm(x):
@@ -117,6 +121,8 @@ class CausalSelfAttention(nn.Module):
             self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
             self.ve_gate_channels = 12
             self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Gated attention (Qwen3-Next): per-element sigmoid gate on the attention output
+        self.attn_gate = Linear(self.n_embd, self.n_head * self.head_dim, bias=False) if config.use_gated_attn else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         if self.use_mla:
@@ -163,6 +169,8 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
+        if self.attn_gate is not None:
+            y = y * torch.sigmoid(self.attn_gate(x))  # gated attention
         y = self.c_proj(y)
         return y
 
@@ -212,6 +220,8 @@ class CausalSelfAttention(nn.Module):
             kv_cache.advance(T)
 
         y = y.contiguous().view(B, T, -1)
+        if self.attn_gate is not None:
+            y = y * torch.sigmoid(self.attn_gate(x))  # gated attention
         y = self.c_proj(y)
         return y
 
@@ -332,6 +342,8 @@ class GPT(nn.Module):
                 torch.nn.init.uniform_(attn.c_k.weight, -s, s)
                 torch.nn.init.uniform_(attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(attn.c_proj.weight) # projections are zero
+            if attn.attn_gate is not None:
+                torch.nn.init.uniform_(attn.attn_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 

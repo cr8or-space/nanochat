@@ -154,9 +154,11 @@ the FP8 dim filter).
 
 ## 5. Attention & positional variants
 
-### ✅ Gated attention (output gating) — Qwen3-Next
-A per-head sigmoid gate on the attention output. A few lines, improves training stability,
-composes cleanly with the existing FA3 path and with MLA. Easy, safe.
+### 🚧 Gated attention (output gating) — Qwen3-Next — **implemented**
+A per-element sigmoid gate on the attention output (before the output projection), computed
+from the block input. Opt-in via `--use-gated-attn`; composes with MHA, GQA, MLA, and MTP
+speculative decoding (all verified in `tests/test_gated_attn.py`). Applied in both attention
+paths in `gpt.py` just before `c_proj`; the gate matrix auto-joins the Muon group.
 
 ### ✅ YaRN / RoPE context extension — Qwen3
 nanochat already precomputes RoPE for 10× length; adding YaRN-style frequency interpolation is
@@ -225,14 +227,13 @@ systems feature; lower priority than the modeling items for an educational repo.
 
 A pragmatic order that front-loads low-risk, high-value wins and defers the invasive change:
 
-1. **Gated attention** — small, safe stability win. *(next)*
-2. **YaRN** — cheap context extension.
-3. **Window-aware KV cache** — engine-only, composes with MLA for more cache savings.
-4. **GQA + FP8-KV** — cheap composable cache cuts (if not relying solely on MLA).
-5. **MoE (aux-loss-free)** — the big lesson; land as a feature-flagged variant.
-6. **Hybrid-thinking data recipe** — SFT-stage, data-bound.
+1. **YaRN** — cheap context extension. *(next)*
+2. **Window-aware KV cache** — engine-only, composes with MLA for more cache savings.
+3. **GQA + FP8-KV** — cheap composable cache cuts (if not relying solely on MLA).
+4. **MoE (aux-loss-free)** — the big lesson; land as a feature-flagged variant.
+5. **Hybrid-thinking data recipe** — SFT-stage, data-bound.
 
-Already landed: **MLA** and **MTP + speculative decoding** (§1).
+Already landed: **MLA**, **MTP + speculative decoding**, and **gated attention** (§1).
 
 Explicitly parked: **Gated DeltaNet, DSA/sparse attention, 1M context, Engram memory,
 Manifold Hyper-Connections, 201-language scale** — see rationale above.
