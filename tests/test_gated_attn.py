@@ -5,14 +5,19 @@ output. It must compose cleanly with MHA, MLA, and MTP speculative decoding.
 Run:
     python -m pytest tests/test_gated_attn.py -v
 
-Runs on CPU via the SDPA fallback (no GPU / FA3 required).
+Runs on GPU (bf16) when available, else CPU (fp32), via the SDPA fallback on non-Hopper hardware.
 """
 
 import pytest
 import torch
 
+from nanochat.common import COMPUTE_DTYPE
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.engine import KVCache, MLAKVCache
+
+# Run on GPU when available; the KV cache uses the model's compute dtype (see test_mla.py).
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PARITY_TOL = 1e-3 if COMPUTE_DTYPE == torch.float32 else 3e-2
 
 
 def _build(use_mla=False, use_gated_attn=True, n_mtp=0):
@@ -24,15 +29,15 @@ def _build(use_mla=False, use_gated_attn=True, n_mtp=0):
     model = GPT(cfg)
     model.init_weights()
     model.eval()
-    return model, cfg
+    return model.to(DEVICE), cfg
 
 
 def _make_cache(cfg, seq_len):
     if cfg.use_mla:
         return MLAKVCache(1, cfg.kv_lora_rank, cfg.qk_rope_head_dim, seq_len, cfg.n_layer,
-                          torch.device("cpu"), torch.float32)
+                          DEVICE, COMPUTE_DTYPE)
     return KVCache(1, cfg.n_kv_head, seq_len, cfg.n_embd // cfg.n_head, cfg.n_layer,
-                   torch.device("cpu"), torch.float32)
+                   DEVICE, COMPUTE_DTYPE)
 
 
 def test_gate_is_created_only_when_enabled():
@@ -47,14 +52,14 @@ def test_gated_attn_prefill_decode_parity(use_mla):
     """Gated attention must preserve prefill+decode == full-forward parity (MHA and MLA)."""
     model, cfg = _build(use_mla=use_mla, use_gated_attn=True)
     T, prefill = 24, 10
-    ids = torch.randint(0, cfg.vocab_size, (1, T))
+    ids = torch.randint(0, cfg.vocab_size, (1, T), device=DEVICE)
     with torch.inference_mode():
         full = model(ids)
         cache = _make_cache(cfg, T)
         model(ids[:, :prefill], kv_cache=cache)
         dec = torch.stack([model(ids[:, i:i+1], kv_cache=cache)[:, -1, :] for i in range(prefill, T)], dim=1)
-    maxdiff = (dec - full[:, prefill:, :]).abs().max().item()
-    assert maxdiff < 1e-3, f"gated-attn parity failed (use_mla={use_mla}): {maxdiff:.3e}"
+    maxdiff = (dec.float() - full[:, prefill:, :].float()).abs().max().item()
+    assert maxdiff < PARITY_TOL, f"gated-attn parity failed (use_mla={use_mla}): {maxdiff:.3e}"
 
 
 @pytest.mark.parametrize("use_mla", [False, True])

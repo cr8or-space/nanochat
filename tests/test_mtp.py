@@ -8,13 +8,19 @@ which is verified to be token-for-token identical to greedy decoding.
 Run:
     python -m pytest tests/test_mtp.py -v
 
-Runs on CPU via the SDPA fallback (no GPU / FA3 required).
+Runs on GPU (bf16) when available, else CPU (fp32), via the SDPA fallback on non-Hopper hardware.
 """
 
 import pytest
 import torch
 
+from nanochat.common import COMPUTE_DTYPE
 from nanochat.gpt import GPT, GPTConfig
+
+# Run on GPU when available (matching the real model's compute dtype); else CPU.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# bf16 accumulates more rounding than fp32, so loosen the loss-decomposition tolerance.
+LOSS_REL = 1e-4 if COMPUTE_DTYPE == torch.float32 else 5e-3
 
 
 def _build(use_mla=False, n_mtp=3, n_layer=4):
@@ -26,7 +32,7 @@ def _build(use_mla=False, n_mtp=3, n_layer=4):
     model = GPT(cfg)
     model.init_weights()
     model.eval()
-    return model, cfg
+    return model.to(DEVICE), cfg
 
 
 @pytest.mark.parametrize("use_mla", [False, True])
@@ -59,7 +65,7 @@ def test_speculative_requires_mtp():
 def test_mtp_loss_is_finite_and_adds_signal(use_mla):
     """Combined MTP loss is finite, and the MTP term is a positive addition to the main loss."""
     model, cfg = _build(use_mla=use_mla, n_mtp=2)
-    ids = torch.randint(0, cfg.vocab_size, (2, 32))
+    ids = torch.randint(0, cfg.vocab_size, (2, 32), device=DEVICE)
     x, y = ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
     with torch.inference_mode():
         combined = model(x, targets=y).item()
@@ -70,7 +76,7 @@ def test_mtp_loss_is_finite_and_adds_signal(use_mla):
         mtp = model._mtp_loss(x, h0, y, "mean").item()
     assert torch.isfinite(torch.tensor(combined))
     assert mtp > 0
-    assert combined == pytest.approx(main + cfg.mtp_weight * mtp, rel=1e-4)
+    assert combined == pytest.approx(main + cfg.mtp_weight * mtp, rel=LOSS_REL)
 
 
 @pytest.mark.slow
@@ -80,7 +86,7 @@ def test_mtp_training_reduces_loss(use_mla):
     torch.manual_seed(0)
     model, cfg = _build(use_mla=use_mla, n_mtp=2)
     opt = model.setup_optimizer()
-    ids = torch.randint(0, cfg.vocab_size, (4, 33))
+    ids = torch.randint(0, cfg.vocab_size, (4, 33), device=DEVICE)
     x, y = ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
     losses = []
     for _ in range(6):

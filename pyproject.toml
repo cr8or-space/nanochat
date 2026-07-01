@@ -23,6 +23,7 @@ dev = [
     "matplotlib>=3.10.8",
     "pytest>=8.0.0",
     "python-dotenv>=1.2.1",
+    "setuptools>=80.9.0",
     "transformers>=4.57.3",
 ]
 

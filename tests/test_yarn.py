@@ -4,17 +4,22 @@ Tests for YaRN RoPE context extension (NTK-by-parts frequency interpolation).
 Run:
     python -m pytest tests/test_yarn.py -v
 
-Runs on CPU (no GPU / FA3 required).
+Runs on GPU (bf16) when available, else CPU (fp32); the analytic inv_freq checks are CPU-only.
 """
 
 import pytest
 import torch
 
+from nanochat.common import COMPUTE_DTYPE
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.engine import KVCache, MLAKVCache
 
 BASE = 100000
-DEV = torch.device("cpu")
+DEV = torch.device("cpu")  # inv_freq is analytic (device-independent); computed on CPU
+# The forward-parity test runs the model on GPU when available; its KV cache uses the model's
+# compute dtype (bf16 on SM>=80, fp32 on CPU). See test_mla.py for the rationale.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PARITY_TOL = 1e-3 if COMPUTE_DTYPE == torch.float32 else 3e-2
 
 
 def _build(rope_scaling=1.0, rope_original_seq_len=0, use_mla=False):
@@ -27,7 +32,7 @@ def _build(rope_scaling=1.0, rope_original_seq_len=0, use_mla=False):
     model = GPT(cfg)
     model.init_weights()
     model.eval()
-    return model, cfg
+    return model.to(DEVICE), cfg
 
 
 def _baseline_inv_freq(head_dim):
@@ -63,13 +68,13 @@ def test_yarn_forward_parity(use_mla):
     """With YaRN active, prefill+decode still matches a full forward (MHA and MLA)."""
     model, cfg = _build(rope_scaling=4.0, rope_original_seq_len=32, use_mla=use_mla)
     T, prefill = 24, 10
-    ids = torch.randint(0, cfg.vocab_size, (1, T))
+    ids = torch.randint(0, cfg.vocab_size, (1, T), device=DEVICE)
     with torch.inference_mode():
         full = model(ids)
         if use_mla:
-            cache = MLAKVCache(1, cfg.kv_lora_rank, cfg.qk_rope_head_dim, T, cfg.n_layer, DEV, torch.float32)
+            cache = MLAKVCache(1, cfg.kv_lora_rank, cfg.qk_rope_head_dim, T, cfg.n_layer, DEVICE, COMPUTE_DTYPE)
         else:
-            cache = KVCache(1, cfg.n_kv_head, T, cfg.n_embd // cfg.n_head, cfg.n_layer, DEV, torch.float32)
+            cache = KVCache(1, cfg.n_kv_head, T, cfg.n_embd // cfg.n_head, cfg.n_layer, DEVICE, COMPUTE_DTYPE)
         model(ids[:, :prefill], kv_cache=cache)
         dec = torch.stack([model(ids[:, i:i+1], kv_cache=cache)[:, -1, :] for i in range(prefill, T)], dim=1)
-    assert (dec - full[:, prefill:, :]).abs().max().item() < 1e-3
+    assert (dec.float() - full[:, prefill:, :].float()).abs().max().item() < PARITY_TOL

@@ -7,7 +7,8 @@ reconstructs full per-head K/V on the fly, maximizing quality-per-cache-byte.
 Run:
     python -m pytest tests/test_mla.py -v
 
-These tests run on CPU via the SDPA fallback (no GPU / FA3 required).
+Runs on GPU (bf16) when available, else CPU (fp32); attention uses the SDPA fallback
+on non-Hopper hardware. The KV cache dtype tracks the model's compute dtype.
 """
 
 from dataclasses import asdict
@@ -15,9 +16,16 @@ from dataclasses import asdict
 import pytest
 import torch
 
+from nanochat.common import COMPUTE_DTYPE
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.engine import KVCache, MLAKVCache, Engine
 from tests.test_engine import ByteTokenizer
+
+# Run on GPU when available (as the real model does), else CPU. The KV cache must use the
+# model's compute dtype (bf16 on SM>=80, fp32 on CPU) — a fp32 cache under a bf16 model would
+# feed mismatched dtypes into the attention kernel. Parity tolerance loosens accordingly.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PARITY_TOL = 1e-3 if COMPUTE_DTYPE == torch.float32 else 3e-2
 
 
 def _build(use_mla, n_layer=4, n_head=4, head_dim=32, vocab_size=262, **mla_kw):
@@ -29,28 +37,28 @@ def _build(use_mla, n_layer=4, n_head=4, head_dim=32, vocab_size=262, **mla_kw):
     model = GPT(cfg)
     model.init_weights()
     model.eval()
-    return model, cfg
+    return model.to(DEVICE), cfg
 
 
 def _make_cache(model, cfg, batch_size, seq_len):
     if cfg.use_mla:
         return MLAKVCache(batch_size, cfg.kv_lora_rank, cfg.qk_rope_head_dim,
-                          seq_len, cfg.n_layer, torch.device("cpu"), torch.float32)
+                          seq_len, cfg.n_layer, DEVICE, COMPUTE_DTYPE)
     return KVCache(batch_size, cfg.n_head, seq_len, cfg.n_embd // cfg.n_head,
-                   cfg.n_layer, torch.device("cpu"), torch.float32)
+                   cfg.n_layer, DEVICE, COMPUTE_DTYPE)
 
 
 def _parity_maxdiff(model, cfg):
     """Max |Δlogits| between a full forward and incremental prefill+decode."""
     T, prefill = 24, 10
-    ids = torch.randint(0, cfg.vocab_size, (1, T))
+    ids = torch.randint(0, cfg.vocab_size, (1, T), device=DEVICE)
     with torch.inference_mode():
         full = model(ids)
         cache = _make_cache(model, cfg, batch_size=1, seq_len=T)
         model(ids[:, :prefill], kv_cache=cache)  # prefill
         dec = [model(ids[:, i:i+1], kv_cache=cache)[:, -1, :] for i in range(prefill, T)]
         dec = torch.stack(dec, dim=1)
-    return (dec - full[:, prefill:, :]).abs().max().item()
+    return (dec.float() - full[:, prefill:, :].float()).abs().max().item()
 
 
 @pytest.mark.parametrize("kv_lora_rank,qk_rope_head_dim", [(64, 16), (32, 16)])
@@ -58,14 +66,14 @@ def test_mla_prefill_decode_parity(kv_lora_rank, qk_rope_head_dim):
     """Incremental prefill+decode through the MLA cache must match a full forward."""
     model, cfg = _build(True, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim)
     maxdiff = _parity_maxdiff(model, cfg)
-    assert maxdiff < 1e-3, f"MLA parity failed: max|Δlogits|={maxdiff:.3e}"
+    assert maxdiff < PARITY_TOL, f"MLA parity failed: max|Δlogits|={maxdiff:.3e}"
 
 
 def test_mha_parity_regression():
     """The standard MHA path must still match (guards against MLA refactor breakage)."""
     model, cfg = _build(False)
     maxdiff = _parity_maxdiff(model, cfg)
-    assert maxdiff < 1e-3, f"MHA parity regressed: max|Δlogits|={maxdiff:.3e}"
+    assert maxdiff < PARITY_TOL, f"MHA parity regressed: max|Δlogits|={maxdiff:.3e}"
 
 
 def test_mla_disables_value_embeddings():
