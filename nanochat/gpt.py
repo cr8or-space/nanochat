@@ -286,8 +286,7 @@ class GPT(nn.Module):
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Optionally tie the output head to the token embedding (share one weight matrix).
         # wte and lm_head are padded to the same vocab size, so the shapes already match.
-        if config.tie_embeddings:
-            self.lm_head.weight = self.transformer.wte.weight
+        self.tie_weights()
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -319,6 +318,16 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
+    def tie_weights(self):
+        """Share one weight matrix between wte and lm_head when tie_embeddings is set.
+
+        Idempotent. Must be (re)called after anything that gives parameters fresh storage and thus
+        breaks the shared-tensor identity: meta-device materialization (`to_empty`) and state_dict
+        loads (`load_state_dict(assign=True)`). init_weights() and __init__ both call it.
+        """
+        if self.config.tie_embeddings:
+            self.lm_head.weight = self.transformer.wte.weight
+
     @torch.no_grad()
     def init_weights(self):
         """
@@ -339,7 +348,9 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
         if not self.config.tie_embeddings:
             torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # (when tied, lm_head.weight *is* wte.weight — already initialized above)
+        # Re-tie after materialization: to_empty()/state_dict load give each param fresh storage,
+        # breaking the __init__ tie, so lm_head must be re-pointed at the (now initialized) wte.
+        self.tie_weights()
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd

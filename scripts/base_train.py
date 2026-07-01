@@ -181,6 +181,7 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
+    model.tie_weights() # assign=True gives fresh storage per param, re-tie if tie_embeddings
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------

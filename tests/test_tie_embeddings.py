@@ -72,3 +72,18 @@ def test_tied_model_trains(kw):
 def test_config_round_trips():
     _, cfg = _build(True)
     assert GPTConfig(**asdict(cfg)).tie_embeddings is True
+
+
+@pytest.mark.parametrize("kw", [{}, dict(n_mtp=1), dict(use_mla=True, qk_rope_head_dim=16)])
+def test_tie_survives_meta_materialization(kw):
+    """base_train builds on meta then to_empty()s — which severs shared storage. init_weights must
+    re-tie, else num_scaling_params' exhaustive-total assert fires (regression: the pretrain smoke)."""
+    cfg = GPTConfig(sequence_len=64, vocab_size=512, n_layer=4, n_head=4, n_kv_head=4,
+                    n_embd=256, window_pattern="SSSL", tie_embeddings=True, **kw)
+    with torch.device("meta"):
+        model = GPT(cfg)
+    model.to_empty(device=DEVICE)   # fresh per-param storage, breaks the __init__ tie
+    model.init_weights()            # must re-establish it
+    assert model.lm_head.weight is model.transformer.wte.weight
+    pc = model.num_scaling_params()  # asserts total == sum(params) internally
+    assert pc['total'] == sum(p.numel() for p in model.parameters())
