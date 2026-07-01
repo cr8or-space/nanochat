@@ -57,6 +57,29 @@ because it compresses without dropping head expressivity (unlike GQA/FP8-KV).
 - **Further follow-up:** the *absorbed-projection* MLA inference trick (fold `kv_up` into
   `c_q`/`c_proj` to skip decompression each decode step) for faster long-context decode.
 
+### 🚧 Multi-Token Prediction (MTP) + speculative decoding — DeepSeek-V3 / Qwen3-Next
+Auxiliary heads predict tokens `t+2, t+3, …` to sharpen the training signal, and double as a
+draft model for **greedy self-speculative decoding** (which nanochat previously lacked).
+
+- Opt-in via `--n-mtp N` (+ `--mtp-weight`); composes with MLA and FP8.
+- MTP modules are **position-wise** (proj + relu² MLP, no attention), so a single-token draft
+  at inference is numerically identical to the training-time computation — no separate MTP KV
+  cache needed. Embedding (`wte`) and output head (`lm_head`) are shared with the main model;
+  the new matmuls auto-join the Muon group.
+- `GPT.generate_speculative` drafts `n_mtp` tokens per step and verifies them in one main
+  forward, accepting the longest greedy-matching prefix (+1 bonus when the whole draft matches),
+  with KV-cache rollback. Output is **token-for-token identical to greedy `generate`** — MTP
+  quality only affects speed, never correctness (verified in `tests/test_mtp.py`).
+- Also fixed a latent gap: the smear feature's prefill path now smears a block's first token
+  from the previous committed token when mid-sequence (`kv_cache` pos > 0), required for
+  speculative-verify parity. (The pre-existing Engine only ever prefilled at pos 0, so this
+  path was never exercised before.)
+- Files: `gpt.py` (MTP heads, `_mtp_loss`, `generate_speculative`), `base_train.py`;
+  tests in `tests/test_mtp.py`.
+- **Follow-ups:** temperature/rejection-sampling speculative decoding (current path is greedy);
+  wiring speculative decode into `Engine.generate`'s batched tool-use loop; transformer-block
+  MTP modules (with their own KV cache) for higher draft acceptance.
+
 ---
 
 ## 2. KV-cache reduction (other options)
@@ -117,12 +140,10 @@ The DeepSeekMoE refinements (a subset of always-on shared experts + many small e
 
 ## 4. Training-signal & optimization
 
-### ✅ Multi-Token Prediction (MTP) — DeepSeek-V3 & Qwen3-Next
-Add auxiliary head(s) predicting tokens *t+2, t+3…* alongside the main next-token head. Mostly
-self-contained (extra heads + a shifted-target loss term in `base_train.py`/`dataloader.py`),
-improves the base-training signal, **and** yields a free draft model for speculative decoding
-(which nanochat lacks entirely). High value, moderate effort, low architectural risk. Strong
-recommend — arguably the best next feature after MLA.
+### 🚧 Multi-Token Prediction (MTP) — DeepSeek-V3 & Qwen3-Next — **implemented, see §1**
+Auxiliary heads predicting tokens *t+2, t+3…* alongside the main next-token head. Improves the
+base-training signal and yields a free draft model for speculative decoding. Landed on this
+branch — see §1 for the design and the position-wise (attention-free) module choice.
 
 ### ✔️/✅ Optimizer & precision
 Muon (+ NorMuon, Polar Express, cautious weight decay) and FP8 training are already present.
@@ -189,10 +210,10 @@ training signal. Skip.
 
 ## 8. Inference / serving
 
-### ✅ Speculative decoding
-Pairs naturally with MTP (§4): use the MTP heads (or a small draft) to propose multiple tokens
-and verify in one forward pass. nanochat's `engine.py` has no speculative path today. Take it
-together with MTP.
+### 🚧 Speculative decoding — **implemented, see §1**
+Pairs naturally with MTP: the MTP heads propose multiple tokens and the main model verifies in
+one forward pass. Landed as `GPT.generate_speculative` (greedy, exact-parity). Follow-ups:
+temperature sampling and integration into the batched tool-use loop — see §1.
 
 ### ⚠️ Inference-time KV quantization / paged cache
 Beyond FP8-KV (§2), paged/block KV management enables larger batch serving. Useful but more of a
@@ -204,15 +225,14 @@ systems feature; lower priority than the modeling items for an educational repo.
 
 A pragmatic order that front-loads low-risk, high-value wins and defers the invasive change:
 
-1. **MTP + speculative decoding** — best training-signal + inference win, self-contained. *(next)*
-2. **Gated attention** — small, safe stability win.
-3. **YaRN** — cheap context extension.
-4. **Window-aware KV cache** — engine-only, composes with MLA for more cache savings.
-5. **GQA + FP8-KV** — cheap composable cache cuts (if not relying solely on MLA).
-6. **MoE (aux-loss-free)** — the big lesson; land as a feature-flagged variant.
-7. **Hybrid-thinking data recipe** — SFT-stage, data-bound.
+1. **Gated attention** — small, safe stability win. *(next)*
+2. **YaRN** — cheap context extension.
+3. **Window-aware KV cache** — engine-only, composes with MLA for more cache savings.
+4. **GQA + FP8-KV** — cheap composable cache cuts (if not relying solely on MLA).
+5. **MoE (aux-loss-free)** — the big lesson; land as a feature-flagged variant.
+6. **Hybrid-thinking data recipe** — SFT-stage, data-bound.
 
-Already landed: **MLA** (§1).
+Already landed: **MLA** and **MTP + speculative decoding** (§1).
 
 Explicitly parked: **Gated DeltaNet, DSA/sparse attention, 1M context, Engram memory,
 Manifold Hyper-Connections, 201-language scale** — see rationale above.

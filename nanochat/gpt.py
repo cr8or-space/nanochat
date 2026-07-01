@@ -44,6 +44,12 @@ class GPTConfig:
     kv_lora_rank: int = 512   # dim of the compressed KV latent (c_KV) that gets cached
     qk_rope_head_dim: int = 64 # decoupled-RoPE dim (shared across heads, also cached)
     q_lora_rank: int = 0      # optional query compression (0 = uncompressed; query is not cached)
+    # Multi-Token Prediction (MTP, DeepSeek-V3 / Qwen3-Next): auxiliary heads that predict
+    # tokens t+2, t+3, ... to sharpen the training signal and enable speculative decoding.
+    # Opt-in; 0 disables it. Modules are position-wise (no attention) so a single-token draft
+    # at inference is numerically identical to the training-time computation.
+    n_mtp: int = 0            # number of extra prediction depths (0 = disabled)
+    mtp_weight: float = 0.3   # weight of the averaged MTP loss relative to the main loss
 
 
 def norm(x):
@@ -272,6 +278,12 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer) and not config.use_mla})
+        # Multi-Token Prediction heads: depth d takes [norm(h^{d-1}) ; norm(emb(t_{i+d}))],
+        # projects to n_embd, runs an MLP, then the shared lm_head. Position-wise (no attention)
+        # so train-time and single-token draft-time computations are identical. Embedding (wte)
+        # and output head (lm_head) are shared with the main model.
+        self.mtp_proj = nn.ModuleList([Linear(2 * config.n_embd, config.n_embd, bias=False) for _ in range(config.n_mtp)])
+        self.mtp_mlp = nn.ModuleList([MLP(config) for _ in range(config.n_mtp)])
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -322,6 +334,13 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        # MTP heads: same init family as the transformer blocks
+        for proj in self.mtp_proj:
+            torch.nn.init.uniform_(proj.weight, -s, s)
+        for mlp in self.mtp_mlp:
+            torch.nn.init.uniform_(mlp.c_fc.weight, -s * 0.4, s * 0.4)
+            torch.nn.init.zeros_(mlp.c_proj.weight)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -471,8 +490,9 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Separate out all parameters into groups. MTP projection/MLP weights are matmuls,
+        # so they join the Muon matrix group alongside the transformer blocks.
+        matrix_params = list(self.transformer.h.parameters()) + list(self.mtp_proj.parameters()) + list(self.mtp_mlp.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -511,7 +531,47 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def _apply_head(self, x_normed):
+        """Shared output head: lm_head, crop padding, fp32, logit softcap. Input must be normed."""
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        logits = self.lm_head(x_normed)
+        logits = logits[..., :self.config.vocab_size] # slice to remove vocab padding
+        logits = logits.float() # fp32 for softcap and loss
+        logits = softcap * torch.tanh(logits / softcap)
+        return logits
+
+    def _mtp_step(self, depth, h_prev, tok):
+        """One MTP module: combine previous hidden with the next token's embedding.
+        h_prev: (B, S, n_embd), tok: (B, S) token ids -> returns h^depth: (B, S, n_embd)."""
+        emb = self.transformer.wte(tok).to(h_prev.dtype)
+        hp = self.mtp_proj[depth](torch.cat([norm(h_prev), norm(emb)], dim=-1))
+        return hp + self.mtp_mlp[depth](norm(hp))
+
+    @staticmethod
+    def _shift_left(t, s, fill):
+        """out[:, i] = t[:, i+s], with fill for i+s out of range."""
+        B, T = t.shape
+        out = torch.full_like(t, fill)
+        if s < T:
+            out[:, :T - s] = t[:, s:]
+        return out
+
+    def _mtp_loss(self, idx, h0, main_targets, loss_reduction):
+        """Averaged cross-entropy of the MTP depths (predicting t+2, t+3, ...)."""
+        losses = []
+        h_prev = h0
+        for d in range(1, self.config.n_mtp + 1):
+            tok = self._shift_left(idx, d, fill=0)          # emb of t_{i+d} (masked positions unused)
+            h = self._mtp_step(d - 1, h_prev, tok)
+            logits_d = self._apply_head(norm(h))
+            tgt = self._shift_left(idx, d + 1, fill=-1)      # target t_{i+d+1}
+            tgt = tgt.masked_fill(main_targets == -1, -1)    # respect the main target's masking
+            losses.append(F.cross_entropy(logits_d.view(-1, logits_d.size(-1)), tgt.view(-1),
+                                          ignore_index=-1, reduction=loss_reduction))
+            h_prev = h
+        return torch.stack(losses).mean()
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_hidden=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -541,6 +601,12 @@ class GPT(nn.Module):
                 # Prefill: apply smear to positions 1+, same as training
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
                 x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                # Mid-sequence prefill (e.g. speculative verify): position 0 continues from the
+                # last committed token, so smear it too. (At the initial prompt prefill pos==0,
+                # prev_embedding is None and position 0 correctly gets no smear.)
+                if x_pre_smear is not None:
+                    g0 = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :1, :24]))
+                    x = torch.cat([x[:, :1] + g0 * x_pre_smear, x[:, 1:]], dim=1)
             elif x_pre_smear is not None:
                 # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
@@ -560,23 +626,22 @@ class GPT(nn.Module):
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
+        h0 = x  # trunk hidden (pre final-norm), consumed by the MTP heads
         x = norm(x)
 
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        logits = self._apply_head(x) # (B, T, vocab_size)
 
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if self.config.n_mtp > 0:
+                loss = loss + self.config.mtp_weight * self._mtp_loss(idx, h0, targets, loss_reduction)
             return loss
         else:
-            # inference: just return the logits directly
-            return logits
+            # inference: return logits (and optionally the trunk hidden for MTP drafting)
+            return (logits, h0) if return_hidden else logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
@@ -608,3 +673,69 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+    @torch.inference_mode()
+    def generate_speculative(self, tokens, max_tokens):
+        """Greedy self-speculative decoding using the MTP heads (batch size 1).
+
+        Each step: one main forward proposes t+1 and gives the trunk hidden; the MTP heads
+        chain a draft of the next n_mtp tokens; a single verify forward over the draft accepts
+        the longest greedy-matching prefix (plus one bonus token when the whole draft matches).
+        Output is token-for-token identical to greedy generate(); MTP quality only affects speed.
+        Yields ints. Requires n_mtp > 0.
+        """
+        assert self.config.n_mtp > 0, "speculative decoding requires n_mtp > 0"
+        from nanochat.engine import KVCache, MLAKVCache
+        device = self.get_device()
+        cfg = self.config
+        L = cfg.n_mtp + 1  # draft block length (main token + n_mtp speculative)
+        capacity = len(tokens) + max_tokens + L + 1
+        if cfg.use_mla:
+            cache = MLAKVCache(1, cfg.kv_lora_rank, cfg.qk_rope_head_dim, capacity, cfg.n_layer, device, COMPUTE_DTYPE)
+        else:
+            cache = KVCache(1, cfg.n_kv_head, capacity, cfg.n_embd // cfg.n_head, cfg.n_layer, device, COMPUTE_DTYPE)
+
+        def emb_normed(tok_id):
+            e = self.transformer.wte(torch.tensor([[tok_id]], device=device)).to(COMPUTE_DTYPE)
+            return norm(e)
+
+        next_input = torch.tensor([tokens], dtype=torch.long, device=device)
+        emitted = 0
+        while emitted < max_tokens:
+            # 1) Advance context; get the greedy next token and the trunk hidden for drafting
+            logits, h0 = self.forward(next_input, kv_cache=cache, return_hidden=True)
+            committed = cache.get_pos()
+            m1 = int(logits[0, -1].argmax())
+            # 2) Draft t+2..t+n_mtp+1 by chaining the MTP heads
+            draft = [m1]
+            h_prev = h0[:, -1:, :]
+            tok = torch.tensor([[m1]], dtype=torch.long, device=device)
+            for d in range(cfg.n_mtp):
+                h = self._mtp_step(d, h_prev, tok)
+                nt = int(self._apply_head(norm(h))[0, -1].argmax())
+                draft.append(nt)
+                tok = torch.tensor([[nt]], dtype=torch.long, device=device)
+                h_prev = h
+            # 3) Verify the whole draft block in one main forward
+            gv = self.forward(torch.tensor([draft], dtype=torch.long, device=device), kv_cache=cache)
+            accepted = [m1]
+            j = 0
+            while j < L - 1:
+                v = int(gv[0, j].argmax())
+                if v == draft[j + 1]:
+                    accepted.append(draft[j + 1]); j += 1
+                else:
+                    accepted.append(v); break
+            else:
+                accepted.append(int(gv[0, L - 1].argmax()))  # whole draft matched -> bonus token
+            # 4) Roll the cache back to the accepted context length. The last accepted token
+            #    (a replacement or bonus) has no cached KV yet, so it becomes the next input.
+            n_ctx = len(accepted) - 1  # draft tokens kept as real context (m1..draft[j])
+            cache.cache_seqlens.fill_(committed + n_ctx)
+            cache.prev_embedding = emb_normed(accepted[-2])  # fix smear state after rollback
+            for t in accepted:
+                if emitted >= max_tokens:
+                    break
+                yield t
+                emitted += 1
+            next_input = torch.tensor([[accepted[-1]]], dtype=torch.long, device=device)

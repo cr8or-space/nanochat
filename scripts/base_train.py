@@ -58,6 +58,9 @@ parser.add_argument("--mla-preset", type=str, default="4x", choices=["4x", "8x"]
 parser.add_argument("--kv-lora-rank", type=int, default=-1, help="MLA KV latent dim (-1 = derive from --mla-preset)")
 parser.add_argument("--qk-rope-head-dim", type=int, default=64, help="MLA decoupled-RoPE head dim (shared across heads)")
 parser.add_argument("--q-lora-rank", type=int, default=0, help="MLA query compression rank (0 = uncompressed queries)")
+# Multi-Token Prediction (MTP): auxiliary heads predicting t+2, t+3, ... (+ enables speculative decoding)
+parser.add_argument("--n-mtp", type=int, default=0, help="number of Multi-Token Prediction depths (0 = disabled)")
+parser.add_argument("--mtp-weight", type=float, default=0.3, help="weight of the averaged MTP loss relative to the main loss")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -147,6 +150,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         use_mla=args.use_mla, kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=args.qk_rope_head_dim, q_lora_rank=args.q_lora_rank,
+        n_mtp=args.n_mtp, mtp_weight=args.mtp_weight,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
