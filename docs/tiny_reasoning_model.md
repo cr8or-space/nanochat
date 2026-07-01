@@ -134,13 +134,17 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
 ## 8. Sequencing / milestones
 0. **Data corpus (milestone 0, gates everything):** assemble curated math/technical text into
    parquet `'text'` shards; repoint `dataset.py:22-27`. Feeds both the tokenizer and pretrain.
-1. **Tokenizer:** single-digit `\p{N}` (`tokenizer.py:30`) + ~12–16K vocab, **trained on the math
-   corpus**; add the `tie_embeddings` flag. Dry-run `num_scaling_params()` per config → confirm ~150M.
-2. **Pretrain baseline:** train d12 + `--use-mla` (+gated, +MTP1) on Stage-A; sanity evals
-   (val_bpb, GSM8K pass@1 from base).
+1. **Tokenizer + model knobs** — ✅ *cheap wins landed this session (flags in place):*
+   `tok_train --single-digit-numbers`, `--tie-embeddings` (both param-count asserts fixed), and
+   the `num_scaling_params` MTP crash fix. **Still pending:** retrain the BPE at ~12–16K on the
+   milestone-0 corpus, and a `num_scaling_params()` dry-run per config to lock the depth.
+2. **Pretrain baseline:** train d12 + `--use-mla` (+gated, +MTP1, ±`--tie-embeddings` ≈122–147M)
+   on Stage-A; sanity evals (val_bpb, GSM8K pass@1 from base).
 3. **Distillation:** teacher CoT generation + verifier reject-sampling → SFT set.
 4. **SFT:** train on distilled CoT (thinking control token); measure GSM8K/MATH pass@1 + CoT quality.
-5. **RLVR:** add MATH/sympy + code verifiers, generalize `chat_rl.py`; GRPO; curriculum. Re-measure.
+5. **RLVR:** ✅ MATH/sympy verifier landed (`tasks/math.py`, `extract_boxed`/`answers_equal`
+   reusable as an RL reward). **Pending:** add code verifier (reuse `execution.py`), generalize
+   `chat_rl.py`'s hardwired GSM8K, GRPO, curriculum.
 6. **(Optional) architecture:** only if 2–5 plateau below target.
 
 ## Risks / notes
