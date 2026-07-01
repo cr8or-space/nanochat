@@ -54,35 +54,62 @@ Key facts this surfaces:
   residual). Disabling them (via MLA, or independently) trades some quality for a large param
   saving — very attractive at tiny scale, but worth an A/B.
 
-## 2. Tokenizer (do first — cheap, high-leverage, low-risk)
-- **Single-digit numbers:** change `SPLIT_PATTERN` at `tokenizer.py:30` from `\p{N}{1,2}` to
-  `\p{N}`. Big win for arithmetic/reasoning; there's precedent (line 71 already documents a
-  deliberate `{1,3}→{1,2}` narrowing).
-- **Trim vocab:** ~12–16K technical tokens instead of 32K. At this scale untied embeddings are
-  `2 × vocab × n_embd` — at 32K/768 that's ~50M, i.e. a third of a 150M budget. Trimming
-  reallocates budget into depth.
-- **Weight tying:** nanochat unties wte/lm_head by default. In the tiny + small-vocab regime,
-  tying halves embedding cost — add an opt-in config flag and A/B it. (Interacts with the
-  separate Muon/AdamW param groups + the `setup_optimizer` count assert — must stay satisfied.)
-- Train the BPE (`scripts/tok_train.py`, rustbpe) on the **technical/math corpus**, not generic web.
+## 2. Data pipeline (the dominant lever AND the critical-path dependency)
+**Grounded in the repo:** `base_train.py` pretrains on **ClimbMix-400B**, a generic shuffled-web
+mix — *no* math/technical corpus by default. The path is **hardcoded** (`dataset.py:22-27`:
+`BASE_URL`, `MAX_SHARD=6542`, dir `base_data_climbmix`); there is **no `--data` CLI arg**. Data is
+**parquet with a `'text'` column, tokenized on the fly** by the BOS-aligned best-fit loader
+(`dataloader.py:74-161`); the last shard is val (`dataloader.py:38`). Crucially, the **tokenizer
+trains on the *same* parquet corpus** (`tok_train.py:11,35` via `parquets_iter_batched`).
 
-## 3. Data pipeline (the dominant lever — most of the real work)
-- **Stage A — pretrain:** textbook-quality technical corpus (open textbooks, arXiv math,
-  math/code StackExchange, curated code, filtered math web). Dedup + quality-filter hard.
-  Budget ~Chinchilla (`target_param_data_ratio`, ~20× params ≈ ~3B tokens at 150M).
-- **Stage B — mid-train (reasoning-dense):** worked solutions, proofs, code-with-tests — shift
-  the distribution toward step-by-step reasoning before SFT.
-- **Stage C — SFT on distilled long-CoT (the big lever):** generate CoT traces with a strong
-  teacher over math problem banks (GSM8K, MATH, competition sets, synthetic templates).
-  **Reject-sample by verifier** — keep only traces whose final answer checks out. Format behind
-  a thinking control token (the hybrid-thinking recipe slots into `chat_sft.py`'s special-token
-  machinery), so thinking/non-thinking is selectable at inference.
+⇒ **Assembling a math/technical parquet corpus (rows with a `'text'` column) is milestone 0** —
+it feeds *both* the BPE and pretrain. The loader is corpus-agnostic, so injection = point
+`dataset.py:22-27` at math parquet shards (or build a mixed shard set). Stages:
+- **Stage A — pretrain corpus:** textbook-quality technical/math/code (open-web-math, proof-pile,
+  arXiv math, math/code StackExchange, curated textbooks/code). Dedup + quality-filter hard, write
+  to parquet `'text'` shards. **Horizon reality-check:** d12+MLA scaling params ≈116M × ~20
+  (`target_param_data_ratio`) ≈ **~2.3B tokens** — a few-B-token curated math corpus is feasible
+  from open sources, so the budget is realistic (not web-scale).
+- **Stage B — mid-train (reasoning-dense):** worked solutions, proofs, code-with-tests — shift the
+  distribution toward step-by-step reasoning before SFT.
+- **Stage C — SFT on distilled long-CoT (the big lever):** generate CoT with a strong teacher over
+  math banks (GSM8K, MATH, competition, synthetic). **Reject-sample by verifier** (keep only
+  correct-final-answer traces). Format behind a thinking control token — the hybrid-thinking recipe
+  slots into `chat_sft.py`'s special-token machinery; the SFT mixture lives at `chat_sft.py:166-179`.
+
+## 3. Tokenizer (cheap, high-leverage — but depends on §2's corpus existing first)
+- **Single-digit numbers:** change `SPLIT_PATTERN` at `tokenizer.py:30` from `\p{N}{1,2}` to
+  `\p{N}`. Confirmed a **genuine one-liner** — nothing else hardcodes 2-digit assumptions (grep
+  found only the pattern itself + a cosmetic banner regex + a `d\d+` model-tag parser); GSM8K
+  answer-extraction works on decoded text so it's unaffected. **Must retrain** the tokenizer (the
+  pattern is frozen into the saved `tokenizer.pkl`, `tok_train.py:56-58`). Precedent: `tokenizer.py:71`
+  documents the earlier deliberate `{1,3}→{1,2}` narrowing.
+- **Trim vocab:** set `tok_train.py` `--vocab-size` (default 32768, `tok_train.py:19`) to ~12–16K.
+  At tiny scale this mostly cuts *total* params (embeddings + value-embeds, which scale with vocab —
+  see §1); the Chinchilla horizon barely moves (keys off `lm_head`, not `wte`).
+- **Weight tying (opt-in `tie_embeddings` flag):** halves embedding cost. Touch points (all in
+  `gpt.py`): add the config field (`GPTConfig` ~29-62); share `lm_head.weight` with `wte`
+  (construction ~278-281); collapse the two `normal_` inits (~330-331); and **fix two param-count
+  asserts that would double-count a shared tensor** — `num_scaling_params` (~526) and
+  `setup_optimizer` (~550) — plus reconcile the two different AdamW LRs those groups use
+  (`unembedding_lr` vs `embedding_lr`, ~559-560). `get_scaling_params` (base_train `283-287`) also
+  changes meaning under tying (re-verify the horizon).
+- **Order:** assemble §2 corpus → edit `SPLIT_PATTERN` + set vocab → `tok_train` **on the math
+  corpus** → then pretrain. (Tokenizer trains on whatever `dataset.py` points at.)
 
 ## 4. RLVR — how a tiny model punches above its weight
-- Build on the existing GRPO scaffold (`scripts/chat_rl.py`, GSM8K; `execution.py` runs code).
-- **Expand verifiers:** exact numeric match (single-digit tokenization makes this cleaner),
-  symbolic equivalence (sympy), and unit-tested code via `execution.py`.
-- Reward-shape for planning/backtracking; add mild CoT-length control. Curriculum easy→hard.
+- **Current state (grounded):** `chat_rl.py` is GRPO-simplified-to-REINFORCE, **hardwired to
+  `GSM8K`** (`chat_rl.py:28,80-81`); reward is `train_task.reward(...)` → 0/1 (`gsm8k.py:110-117`)
+  via **exact string match** on the `#### <number>` marker (`GSM_RE`, `gsm8k.py:22-34,87-108`) — no
+  tolerance, no sympy. A **code sandbox already exists** (`execution.py:134-211`, subprocess +
+  timeout + memory cap), used by HumanEval (`humaneval.py:79-97`).
+- **A verifier is just a `Task`** (`tasks/common.py:10-51`): implement `eval_type`, `num_examples`,
+  `get_example` (returns a messages conversation), `evaluate`, and **`reward`** (required for RL).
+- **Expand verifiers:** (a) MATH-style task with **sympy** symbolic equivalence in `evaluate`/`reward`
+  (parse `\boxed{}`); (b) **unit-tested code** by reusing `execute_code` from `execution.py`;
+  (c) numeric-with-tolerance (single-digit tokenization makes exact match cleaner too). Generalize
+  `chat_rl.py`'s hardwired task selection to train against a mixture.
+- Reward-shape for planning/backtracking; add mild CoT-length control; curriculum easy→hard.
 
 ## 5. Tool-augmented reasoning
 - The Engine already has a Python/calculator tool loop (`<|python_start|>` … state machine).
@@ -96,16 +123,24 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
 (MTP, YaRN, MLA, gated attn).
 
 ## 7. Evaluation
-- Use `tasks/` (gsm8k present; **add a MATH task** — not currently in the repo). Track pass@1,
-  CoT length, tool-use rate, and `val_bpb` on held-out technical text. Keep a fixed eval set from
-  day one so pipeline changes are measurable.
+- `tasks/` today has **only GSM8K for math** (MMLU/ARC are multiple-choice; HumanEval is code).
+  **Add `tasks/math.py`** (competition math, sympy-checked) subclassing `Task`, then register it in
+  the `chat_eval.py` factory + `all_tasks` (`chat_eval.py:162,204-211`), optionally the SFT mixture
+  (`chat_sft.py:166-179`) and RL (`chat_rl.py`).
+- Track pass@1 (GSM8K + MATH), CoT length, tool-use rate, and `val_bpb` on held-out technical text
+  (`token_bytes.pt` machinery, `tok_train.py:79-91`). Freeze a fixed eval set from day one so every
+  pipeline change is measurable.
 
 ## 8. Sequencing / milestones
-1. **Tokenizer:** single-digit `\p{N}`, ~12–16K technical BPE, tying flag. Dry-run param count → confirm ~150M at chosen depth.
-2. **Pretrain baseline:** assemble Stage-A corpus; train d12–14; sanity evals (val_bpb, gsm8k pass@1 from base).
+0. **Data corpus (milestone 0, gates everything):** assemble curated math/technical text into
+   parquet `'text'` shards; repoint `dataset.py:22-27`. Feeds both the tokenizer and pretrain.
+1. **Tokenizer:** single-digit `\p{N}` (`tokenizer.py:30`) + ~12–16K vocab, **trained on the math
+   corpus**; add the `tie_embeddings` flag. Dry-run `num_scaling_params()` per config → confirm ~150M.
+2. **Pretrain baseline:** train d12 + `--use-mla` (+gated, +MTP1) on Stage-A; sanity evals
+   (val_bpb, GSM8K pass@1 from base).
 3. **Distillation:** teacher CoT generation + verifier reject-sampling → SFT set.
-4. **SFT:** train on distilled CoT; measure gsm8k / MATH pass@1 and CoT quality.
-5. **RLVR:** expand verifiers; GRPO; curriculum. Re-measure.
+4. **SFT:** train on distilled CoT (thinking control token); measure GSM8K/MATH pass@1 + CoT quality.
+5. **RLVR:** add MATH/sympy + code verifiers, generalize `chat_rl.py`; GRPO; curriculum. Re-measure.
 6. **(Optional) architecture:** only if 2–5 plateau below target.
 
 ## Risks / notes
