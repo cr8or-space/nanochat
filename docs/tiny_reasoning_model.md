@@ -153,8 +153,25 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
    convergence). Checkpoint: `~/.cache/nanochat-math/base_checkpoints/finemath-d12/` (step 2353).
    Qualitative check: "derivative of x^2 is" → "2x" (correct); base-model repetition/web-artifacts as
    expected pre-SFT. Shards used unshuffled (fine here). To train longer, raise `--target-param-data-ratio`.
-3. **Distillation:** teacher CoT generation + verifier reject-sampling → SFT set.
-4. **SFT:** train on distilled CoT (thinking control token); measure GSM8K/MATH pass@1 + CoT quality.
+3. **Distillation (milestone 3)** — ✅ *done this session.* Teacher = **open R1 traces**
+   (`open-r1/OpenR1-Math-220k`, `default`/curated config, 93,733 problems / 193,767 R1 generations)
+   — decided with the user (free, already answer-verified, R1-quality; no API cost). Built
+   `scripts/prepare_math_cot.py`: reject-samples to correct-final-answer traces (OpenR1's
+   `correctness_math_verify` flag as primary signal; **our sympy grader `tasks/math.answers_equal`
+   rescues flag-False traces** — 1,844 rescued, honoring the verifier step), length-filters to the
+   base model's 2048-token context, and keeps the **shortest** correct trace per problem (most
+   learnable for ~110M, packs more/batch). The literal `<think>…</think>` tags in the R1 traces
+   **are** the thinking-control format — no tokenizer/embedding surgery. Output = CustomJSON-format
+   JSONL at `~/.cache/nanochat-math/math_cot/{train,val}.jsonl` (**8,324 train / 500 val**). Length
+   is the dominant filter (only ~9% of problems yield a ≤2048-tok trace; p50=1621, p90=1964).
+   Reproduce: `NANOCHAT_BASE_DIR=…nanochat-math … .venv/bin/python -m scripts.prepare_math_cot
+   --config default --max-seq-len 2048 --max-traces 60000 --val-size 500`.
+   **Lever if evals want longer reasoning:** raise `--max-seq-len` (+ YaRN, held in reserve) to
+   admit more of the R1 trace-length distribution — the current 2048 cap discards the long tail.
+4. **SFT (milestone 4):** wired the CoT set into `scripts/chat_sft.py` via a new `--math-cot-epochs`
+   (default 3, `CustomJSON` on the prepared JSONL, added to both train + val mixtures; auto-skips if
+   the file is absent). Train from `finemath-d12` base; measure GSM8K/MATH pass@1 (already registered
+   in `chat_eval.py`) + CoT quality. **In progress this session.**
 5. **RLVR:** ✅ MATH/sympy verifier landed (`tasks/math.py`, `extract_boxed`/`answers_equal`
    reusable as an RL reward). **Pending:** add code verifier (reuse `execution.py`), generalize
    `chat_rl.py`'s hardwired GSM8K, GRPO, curriculum.

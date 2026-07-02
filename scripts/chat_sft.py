@@ -66,6 +66,7 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--math-cot-epochs", type=int, default=3, help="epochs of distilled long-CoT math (see scripts/prepare_math_cot.py); 0 disables")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -162,22 +163,32 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+# Distilled long-CoT math set (built by scripts/prepare_math_cot.py). Optional: only added if present.
+math_cot_dir = os.path.join(base_dir, "math_cot")
+math_cot_train_path = os.path.join(math_cot_dir, "train.jsonl")
+math_cot_val_path = os.path.join(math_cot_dir, "val.jsonl")
+have_math_cot = args.math_cot_epochs > 0 and os.path.exists(math_cot_train_path)
+if args.math_cot_epochs > 0 and not have_math_cot:
+    print0(f"NOTE: --math-cot-epochs={args.math_cot_epochs} but {math_cot_train_path} is missing; skipping math CoT")
 train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
+    *([CustomJSON(filepath=math_cot_train_path) for _ in range(args.math_cot_epochs)] if have_math_cot else []), # distilled long-CoT math
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]
 train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+math_cot_rows = len(CustomJSON(filepath=math_cot_train_path)) * args.math_cot_epochs if have_math_cot else 0
+print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}, MathCoT x{args.math_cot_epochs} = {math_cot_rows:,} rows)")
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+    *([CustomJSON(filepath=math_cot_val_path)] if (have_math_cot and os.path.exists(math_cot_val_path)) else []), # held-out CoT
+]) # total: 24K + 5.2K + 0.42K (+0.5K CoT) ~= 29.6K rows
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.
