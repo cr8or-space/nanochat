@@ -103,6 +103,7 @@ def build_model(checkpoint_dir, step, device, phase):
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+    model.tie_weights() # assign=True gives each param fresh storage, re-severing the tie; re-tie (mirrors base_train)
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
