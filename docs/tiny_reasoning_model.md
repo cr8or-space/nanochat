@@ -184,6 +184,18 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
    never reach `\boxed{}` (temp helps only a little); (ii) weak arithmetic/parsing (e.g. misread "2¾ h"
    as 2.5). **Bottlenecks, highest-leverage first:** base is *undertrained* (1.23B of ~2.07B horizon,
    9.42B avail); 2048 cap dropped ~91% of CoT traces; only 8.3K traces / 1 epoch; RLVR not yet run.
+
+   **Base-to-horizon retrain (2026-07-02, chose with user):** retrained d12 from scratch at
+   `--target-param-data-ratio 20` (Chinchilla) → **3,922 steps / ~2.06B tokens / 3.2h**, **val bpb
+   0.997 → 0.942**. New tag `finemath-d12-r20` (old base + baseline preserved). Re-ran the SAME
+   SFT+eval pipeline on it (no code changes): SFT **val bpb 0.5437 → 0.5252**; eval (temp 0.6, 200-prob):
+   **MATH 1.0% → 2.5%, GSM8K 2.0% → 3.0%**. Confirms the base was the binding constraint; ~0.8B extra
+   pretrain tokens ~2×'d MATH. (Absolute numbers still low + n=200 with sampling ⇒ wide CIs; val bpb is
+   the more reliable signal. All metrics moved the same direction.) Checkpoints: base
+   `base_checkpoints/finemath-d12-r20/` step 3922, SFT `chatsft_checkpoints/finemath-d12-r20/` step 1137.
+   **Next levers unchanged:** longer-seq CoT (+YaRN) for ~10× data, then RLVR (milestone 5) now that the
+   SFT baseline is a bit stronger. Could also push pretrain past Chinchilla (9.42B avail) — small models
+   overtrain well.
 5. **RLVR:** ✅ MATH/sympy verifier landed (`tasks/math.py`, `extract_boxed`/`answers_equal`
    reusable as an RL reward). **Pending:** add code verifier (reuse `execution.py`), generalize
    `chat_rl.py`'s hardwired GSM8K, GRPO, curriculum.
