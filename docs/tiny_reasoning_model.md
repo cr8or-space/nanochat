@@ -168,10 +168,22 @@ latent reasoning (Coconut), adaptive compute. The landed features already lean t
    --config default --max-seq-len 2048 --max-traces 60000 --val-size 500`.
    **Lever if evals want longer reasoning:** raise `--max-seq-len` (+ YaRN, held in reserve) to
    admit more of the R1 trace-length distribution — the current 2048 cap discards the long tail.
-4. **SFT (milestone 4):** wired the CoT set into `scripts/chat_sft.py` via a new `--math-cot-epochs`
-   (default 3, `CustomJSON` on the prepared JSONL, added to both train + val mixtures; auto-skips if
-   the file is absent). Train from `finemath-d12` base; measure GSM8K/MATH pass@1 (already registered
-   in `chat_eval.py`) + CoT quality. **In progress this session.**
+4. **SFT (milestone 4)** — ✅ *done this session.* Wired the CoT set into `scripts/chat_sft.py` via a
+   new `--math-cot-epochs` (default 3, `CustomJSON` on the prepared JSONL, added to both train + val
+   mixtures; auto-skips if absent). Trained from `finemath-d12` base, full mixture 1.09M rows (incl.
+   MathCoT ×3 = 24,972), bs32, 1 epoch / **1,137 steps / 55 min / 178K tok/s**, peak 38GB. **Val bpb
+   0.997 → 0.544.** Checkpoint: `~/.cache/nanochat-math/chatsft_checkpoints/finemath-d12/` step 1137.
+   **Two latent nanochat bugs fixed en route** (separate commits): (a) `checkpoint_manager.build_model`
+   didn't re-tie embeddings after `load_state_dict(assign=True)` → `setup_optimizer` assert crash;
+   (b) `chat_sft` saved an incomplete `model_config` (dropped MLA/MTP/gated/tie/rope flags) → reload
+   rebuilt a vanilla GPT and crashed on state_dict mismatch; now saves `asdict(config)`.
+   **Eval (200-problem subsets, `chat_eval -a MATH|GSM8K`):** greedy MATH 0.5% / GSM8K 1.5%;
+   temp-0.6 MATH 1.0% / GSM8K 2.0%. **Pipeline verified correct** (formats right: `\boxed{}` for MATH,
+   `#### N` + `<|python_start|>` tool-calls for GSM8K). Low scores are genuine capability limits, not a
+   broken pipeline. Failure modes: (i) greedy induces degenerate repetition loops in `<think>` that
+   never reach `\boxed{}` (temp helps only a little); (ii) weak arithmetic/parsing (e.g. misread "2¾ h"
+   as 2.5). **Bottlenecks, highest-leverage first:** base is *undertrained* (1.23B of ~2.07B horizon,
+   9.42B avail); 2048 cap dropped ~91% of CoT traces; only 8.3K traces / 1 epoch; RLVR not yet run.
 5. **RLVR:** ✅ MATH/sympy verifier landed (`tasks/math.py`, `extract_boxed`/`answers_equal`
    reusable as an RL reward). **Pending:** add code verifier (reuse `execution.py`), generalize
    `chat_rl.py`'s hardwired GSM8K, GRPO, curriculum.
