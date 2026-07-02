@@ -12,6 +12,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 import gc
 import argparse
 import os
+from dataclasses import asdict
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
@@ -418,15 +419,11 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
+                # Save the FULL model config (asdict), not a hand-picked subset. The old subset
+                # dropped non-default architecture flags (use_mla, n_mtp, use_gated_attn,
+                # tie_embeddings, rope_*), so reloading an MLA/MTP model for eval/RL rebuilt a
+                # vanilla GPT and crashed on a state_dict mismatch. Mirrors base_train.py.
+                "model_config": asdict(orig_model.config),
                 "user_config": user_config, # inputs to the training script
             },
             rank=ddp_rank,
